@@ -37,7 +37,7 @@ from ax.core.types import (
 )
 from ax.core.utils import extract_map_keys_from_opt_config, get_target_trial_index
 from ax.exceptions.core import UnsupportedError, UserInputError
-from ax.exceptions.model import AdapterMethodNotImplementedError
+from ax.exceptions.model import AdapterMethodNotImplementedError, ModelError
 from ax.modelbridge.data_utils import DataLoaderConfig
 from ax.modelbridge.transforms.base import Transform
 from ax.modelbridge.transforms.cast import Cast
@@ -477,20 +477,21 @@ class Adapter:
             map_keys = extract_map_keys_from_opt_config(
                 optimization_config=self._optimization_config
             )
-            if len(map_keys) > 1:
+            if len(map_keys) == 1:
+                map_key = map_keys.pop()
+                # Pick the observation with maximal map key value.
+                self._status_quo = max(
+                    status_quo_observations,
+                    key=lambda obs: obs.features.metadata[map_key],
+                )
+            else:
                 logger.warning(
                     f"Status quo {self._status_quo_name} was found in the data with "
                     "multiple observations, and the optimization config includes "
-                    "multiple map keys. `Adapter.status_quo` will not be set."
+                    f"{len(map_keys)} map keys. `Adapter.status_quo` will not be set."
                 )
-                return
-            map_key = map_keys.pop()
-            # Pick the observation with maximal map key value.
-            self._status_quo = max(
-                status_quo_observations, key=lambda obs: obs.features.metadata[map_key]
-            )
-
-        self._status_quo = status_quo_observations[-1]
+        else:
+            self._status_quo = status_quo_observations[-1]
 
     @property
     def status_quo_data_by_trial(self) -> dict[int, ObservationData] | None:
@@ -568,88 +569,14 @@ class Adapter:
             f"{self.__class__.__name__} does not implement `_fit`."
         )
 
-    def _batch_predict(
-        self,
-        observation_features: list[ObservationFeatures],
-        use_posterior_predictive: bool = False,
-    ) -> list[ObservationData]:
-        """Predict a list of ObservationFeatures together."""
-        # Get modifiable version
-        observation_features = deepcopy(observation_features)
-
-        # Transform
-        for t in self.transforms.values():
-            observation_features = t.transform_observation_features(
-                observation_features
-            )
-        # Apply terminal transform and predict
-        observation_data = self._predict(
-            observation_features=observation_features,
-            use_posterior_predictive=use_posterior_predictive,
-        )
-
-        # Apply reverse transforms, in reverse order
-        pred_observations = recombine_observations(
-            observation_features=observation_features, observation_data=observation_data
-        )
-
-        for t in reversed(list(self.transforms.values())):
-            pred_observations = t.untransform_observations(pred_observations)
-        return [obs.data for obs in pred_observations]
-
-    def _single_predict(
-        self,
-        observation_features: list[ObservationFeatures],
-        use_posterior_predictive: bool = False,
-    ) -> list[ObservationData]:
-        """Predict one ObservationFeature at a time."""
-        observation_data = []
-        for obsf in observation_features:
-            try:
-                obsd = self._batch_predict(
-                    observation_features=[obsf],
-                    use_posterior_predictive=use_posterior_predictive,
-                )
-                observation_data += obsd
-            except (TypeError, ValueError) as e:
-                # If the prediction is not out of design, this is a real error.
-                # Let's re-raise.
-                if self.model_space.check_membership(obsf.parameters):
-                    logger.debug(obsf.parameters)
-                    logger.debug(self.model_space)
-                    raise e from None
-                # Prediction is out of design.
-                # Training data is untransformed already.
-                observation = next(
-                    (
-                        data
-                        for data in self.get_training_data()
-                        if obsf.parameters == data.features.parameters
-                        and obsf.trial_index == data.features.trial_index
-                    ),
-                    None,
-                )
-                if not observation:
-                    raise ValueError(
-                        "Out-of-design point could not be predicted, and was "
-                        "not found in the training data."
-                    )
-                observation_data.append(observation.data)
-        return observation_data
-
     def _predict_observation_data(
         self,
         observation_features: list[ObservationFeatures],
         use_posterior_predictive: bool = False,
+        untransform: bool = True,
     ) -> list[ObservationData]:
         """
         Like 'predict' method, but returns results as a list of ObservationData
-
-        Predictions are made for all outcomes.
-        If an out-of-design observation can successfully be transformed,
-        the predicted value will be returned.
-        Otherwise, we will attempt to find that observation in the training data
-        and return the raw value.
 
         Args:
             observation_features: A list of observation features to predict.
@@ -657,21 +584,41 @@ class Adapter:
                 should be from the posterior predictive (i.e. including
                 observation noise).
                 This option is only supported by the ``BoTorchGenerator``.
+            untransform: Whether to untransform the predictions to the original
+                scale before returning.
 
         Returns:
-            List of `ObservationData`
+            List of `ObservationData`, each representing (independent) predictions
+            for the corresponding `ObservationFeatures` input.
         """
-        # Predict in single batch.
-        try:
-            observation_data = self._batch_predict(
-                observation_features=observation_features,
-                use_posterior_predictive=use_posterior_predictive,
+        input_len = len(observation_features)
+        observation_features = deepcopy(observation_features)
+        # Transform
+        for t in self.transforms.values():
+            observation_features = t.transform_observation_features(
+                observation_features=observation_features
             )
-        # Predict one by one.
-        except (TypeError, ValueError):
-            observation_data = self._single_predict(
+        # Apply terminal transform and predict
+        observation_data = self._predict(
+            observation_features=observation_features,
+            use_posterior_predictive=use_posterior_predictive,
+        )
+        if untransform:
+            # Apply reverse transforms, in reverse order
+            pred_observations = recombine_observations(
                 observation_features=observation_features,
-                use_posterior_predictive=use_posterior_predictive,
+                observation_data=observation_data,
+            )
+
+            for t in reversed(list(self.transforms.values())):
+                pred_observations = t.untransform_observations(pred_observations)
+            observation_data = [obs.data for obs in pred_observations]
+        if (output_len := len(observation_data)) != input_len:
+            raise ModelError(
+                f"Predictions resulted in fewer outcomes ({output_len}) than "
+                f"expected ({input_len}). This can happen if a transform modifies "
+                "the number of observation features, such as `Cast` dropping any "
+                "observation features with `None` parameter values. "
             )
         return observation_data
 
@@ -910,13 +857,19 @@ class Adapter:
             observation_features=observation_features,
             arms_by_signature=self._arms_by_signature,
         )
+
         # If experiment has immutable search space and metrics, no need to
         # save them on generator runs.
         immutable = getattr(
             self, "_experiment_has_immutable_search_space_and_opt_config", False
         )
         optimization_config = None if immutable else base_gen_args.optimization_config
-        gr = GeneratorRun(
+        # Remove information about the objective thresholds - we do not want to save
+        # these as `ObjectiveThreshold` objects, as this causes storage headaches.
+        gen_metadata = gen_results.gen_metadata
+        gen_metadata.pop("objective_thresholds", None)
+
+        generator_run = GeneratorRun(
             arms=arms,
             weights=gen_results.weights,
             optimization_config=optimization_config,
@@ -930,18 +883,18 @@ class Adapter:
             model_key=self._model_key,
             model_kwargs=self._model_kwargs,
             bridge_kwargs=self._bridge_kwargs,
-            gen_metadata=gen_results.gen_metadata,
+            gen_metadata=gen_metadata,
             model_state_after_gen=self._get_serialized_model_state(),
             candidate_metadata_by_arm_signature=candidate_metadata,
         )
-        if len(gr.arms) < n:
+        if len(generator_run.arms) < n:
             logger.warning(
                 f"{self} was not able to generate {n} unique candidates. "
                 "Generated arms have the following weights, as there are repeats:\n"
-                f"{gr.weights}"
+                f"{generator_run.weights}"
             )
         self.fit_time_since_gen = 0.0
-        return gr
+        return generator_run
 
     def _gen(
         self,

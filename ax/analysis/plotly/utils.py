@@ -5,18 +5,22 @@
 
 # pyre-strict
 
+import math
+from typing import Sequence
+
 import numpy as np
+import pandas as pd
 import torch
 from ax.core.experiment import Experiment
 from ax.core.objective import MultiObjective, ScalarizedObjective
 from ax.core.outcome_constraint import ComparisonOp, OutcomeConstraint
+from ax.core.trial_status import TrialStatus
 from ax.exceptions.core import UnsupportedError, UserInputError
-from ax.generation_strategy.generation_strategy import GenerationStrategy
 from ax.modelbridge.base import Adapter
 
 from botorch.utils.probability.utils import compute_log_prob_feas_from_bounds
 from numpy.typing import NDArray
-from pyre_extensions import none_throws
+from plotly import express as px
 
 # Because normal distributions have long tails, every arm has a non-zero
 # probability of violating the constraint. But below a certain threshold, we
@@ -28,6 +32,87 @@ CONFIDENCE_INTERVAL_BLUE = "rgba(0, 0, 255, 0.2)"
 MARKER_BLUE = "rgba(0, 0, 255, 0.3)"  # slightly more opaque than the CI blue
 CANDIDATE_RED = "rgba(220, 20, 60, 0.3)"
 CANDIDATE_CI_RED = "rgba(220, 20, 60, 0.2)"
+
+
+# Use a consistent color for each TrialStatus name, sourced from
+# the default Plotly color palette. See https://plotly.com/python/discrete-color/
+# for more details and swatches.
+TRIAL_STATUS_TO_PLOTLY_COLOR: dict[str, str] = {
+    TrialStatus.CANDIDATE.name: px.colors.qualitative.Plotly[8],  # Pink
+    TrialStatus.STAGED.name: px.colors.qualitative.Plotly[3],  # Purple
+    TrialStatus.FAILED.name: px.colors.qualitative.Plotly[4],  # Orange
+    TrialStatus.COMPLETED.name: px.colors.qualitative.Plotly[0],  # Blue
+    TrialStatus.RUNNING.name: px.colors.qualitative.Plotly[2],  # Green
+    TrialStatus.ABANDONED.name: px.colors.qualitative.Plotly[1],  # Red
+    TrialStatus.EARLY_STOPPED.name: px.colors.qualitative.Plotly[5],  # Teal
+}
+
+# Always use the same transparency factor for CI colors to improve legibility when many
+# scatter points are plotted on the same plot.
+CI_ALPHA: float = 0.5
+
+
+def trial_status_to_plotly_color(
+    trial_status: str,
+    ci_transparency: bool = False,
+) -> str:
+    """
+    Standardize the colors which correspond to a TrialStatus name across the Plotly
+    analyses.
+
+    Always use transparency for CI colors to improve legibility.
+    """
+    hex_color = TRIAL_STATUS_TO_PLOTLY_COLOR.get(
+        trial_status,
+        # Default to pink, treating unknown trial status as CANDIDATE
+        px.colors.qualitative.Plotly[8],
+    )
+
+    red, green, blue = px.colors.hex_to_rgb(hex_color)
+    alpha = CI_ALPHA if ci_transparency else 1
+
+    return f"rgba({red}, {green}, {blue}, {alpha})"
+
+
+def get_arm_tooltip(
+    row: pd.Series,
+    metric_names: Sequence[str],
+) -> str:
+    """
+    Given a row from ax.analysis.utils.prepare_arm_data return a tooltip. This should
+    be used in every Plotly analysis where we source data from prepare_arm_data.
+    """
+
+    trial_str = f"Trial: {row['trial_index']}"
+    arm_str = f"Arm: {row['arm_name']}"
+    status_str = f"Status: {row['trial_status']}"
+    generation_node_str = f"Generation Node: {row['generation_node']}"
+
+    metric_strs = [
+        (
+            (f"{metric_name}: {row[f'{metric_name}_mean']:.5f}")
+            + f"±{1.96 * row[f'{metric_name}_sem']:.5f}"
+            if not math.isnan(row[f"{metric_name}_sem"])
+            else ""
+        )
+        for metric_name in metric_names
+    ]
+
+    if row["p_feasible"] < MINIMUM_CONTRAINT_VIOLATION_THRESHOLD:
+        constraints_warning_str = "[Warning] This arm is likely infeasible"
+    else:
+        constraints_warning_str = ""
+
+    return "<br />".join(
+        [
+            trial_str,
+            arm_str,
+            status_str,
+            generation_node_str,
+            *metric_strs,
+            constraints_warning_str,
+        ]
+    )
 
 
 def get_constraint_violated_probabilities(
@@ -160,55 +245,6 @@ def get_nudge_value(
         nudge += 1
 
     return nudge
-
-
-def get_adapter(
-    analysis_name: str,
-    experiment: Experiment | None = None,
-    generation_strategy: GenerationStrategy | None = None,
-    adapter: Adapter | None = None,
-    enforce_supports_predictions: bool = False,
-) -> Adapter:
-    """
-    Select the appropriate adapter for the analysis being performed.
-
-    Args:
-        analysis_name: The name of the analysis card for error logging
-        experiment: The experiment associated with this analysis
-        generation_strategy: The generation strategy associated with this analysis
-        adapter: A custom adapter that can be passed in during adhoc computation. This
-            will always take precedence.
-    """
-    # If adapter is provided, it will take precedence, otherwise use the current
-    # adapter from the generation strategy
-    if adapter is None:
-        if generation_strategy is None:
-            raise UserInputError(
-                f"{analysis_name} requires a GenerationStrategy if no custom "
-                "adapter is provided."
-            )
-
-        # If model is not fit already, fit it
-        if generation_strategy.model is None:
-            if experiment is None:
-                raise UserInputError(
-                    "Unable to find a model on the GenerationStrategy,"
-                    " so Experiment must be provided to fit the model"
-                    f" to compute {analysis_name}."
-                )
-            generation_strategy._curr._fit(experiment=experiment)
-        adapter = none_throws(generation_strategy.model)  # model should be fit now
-
-    # if the adapter requested must support predictions, but does not, raise an error
-    if enforce_supports_predictions and not is_predictive(adapter=adapter):
-        raise UserInputError(
-            f"{analysis_name} requires a GenerationStrategy which is "
-            "in a state where the current model supports prediction. "
-            f"The current model is {adapter._model_key} and does not support "
-            "prediction."
-        )
-
-    return adapter
 
 
 def is_predictive(adapter: Adapter) -> bool:

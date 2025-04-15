@@ -25,14 +25,21 @@ class AuxiliaryExperiment(SortableBase):
     def __init__(
         self,
         experiment: core.experiment.Experiment,
+        is_active: bool = True,
         data: Data | None = None,
     ) -> None:
         """
         Lightweight container of an experiment, and its data,
         that will be used as auxiliary information for another experiment.
+        Args:
+            experiment: The Ax experiment with the auxiliary data.
+            is_active: Whether the auxiliary experiment relation to the target
+                experiment is currently active.
+            data: Auxiliary data.
         """
         self.experiment = experiment
         self.data: Data = data or experiment.lookup_data()
+        self.is_active = is_active
 
     def _unique_id(self) -> str:
         # While there can be multiple `AuxiliarySource`-s made from the same

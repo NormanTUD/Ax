@@ -5,7 +5,11 @@
 
 # pyre-strict
 
-from ax.analysis.analysis import AnalysisCardCategory, AnalysisCardLevel
+from ax.analysis.analysis import (
+    AnalysisBlobAnnotation,
+    AnalysisCardCategory,
+    AnalysisCardLevel,
+)
 from ax.analysis.plotly.surface.slice import SlicePlot
 from ax.core.trial import Trial
 from ax.exceptions.core import UserInputError
@@ -47,7 +51,9 @@ class TestSlicePlot(TestCase):
         with self.assertRaisesRegex(UserInputError, "requires an Experiment"):
             analysis.compute()
         # Test that it fails if no GenerationStrategy is provided
-        with self.assertRaisesRegex(UserInputError, "requires a GenerationStrategy"):
+        with self.assertRaisesRegex(
+            UserInputError, "Must provide either a GenerationStrategy or an Adapter"
+        ):
             analysis.compute(experiment=self.client.experiment)
 
         (card,) = analysis.compute(
@@ -78,7 +84,7 @@ class TestSlicePlot(TestCase):
             {"x", "bar_mean", "bar_sem", "sampled"},
         )
         self.assertIsNotNone(card.blob)
-        self.assertEqual(card.blob_annotation, "plotly")
+        self.assertEqual(card.blob_annotation, AnalysisBlobAnnotation.PLOTLY)
 
         # Assert that any row where sampled is True has a value of x that is
         # sampled in at least one trial.

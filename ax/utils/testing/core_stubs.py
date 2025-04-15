@@ -102,10 +102,14 @@ from ax.metrics.factorial import FactorialMetric
 from ax.metrics.hartmann6 import Hartmann6Metric
 from ax.modelbridge.factory import Cont_X_trans, Generators, get_factorial, get_sobol
 from ax.models.torch.botorch_modular.acquisition import Acquisition
-from ax.models.torch.botorch_modular.kernels import ScaleMaternKernel
+from ax.models.torch.botorch_modular.kernels import DefaultRBFKernel, ScaleMaternKernel
 from ax.models.torch.botorch_modular.model import BoTorchGenerator
 from ax.models.torch.botorch_modular.sebo import SEBOAcquisition
-from ax.models.torch.botorch_modular.surrogate import Surrogate, SurrogateSpec
+from ax.models.torch.botorch_modular.surrogate import (
+    ModelConfig,
+    Surrogate,
+    SurrogateSpec,
+)
 from ax.models.winsorization_config import WinsorizationConfig
 from ax.runners.synthetic import SyntheticRunner
 from ax.service.utils.scheduler_options import SchedulerOptions, TrialType
@@ -315,7 +319,9 @@ def get_branin_experiment(
 
             if with_completed_batch:
                 trial.mark_running(no_runner_required=True)
-                exp.attach_data(get_branin_data_batch(batch=trial))
+                exp.attach_data(
+                    get_branin_data_batch(batch=trial, metrics=[*exp.metrics.keys()])
+                )
                 trial.mark_completed()
 
     if with_trial or with_completed_trial:
@@ -2384,10 +2390,13 @@ def get_branin_data(
 
 
 def get_branin_data_batch(
-    batch: BatchTrial, fill_vals: dict[str, float] | None = None
+    batch: BatchTrial,
+    fill_vals: dict[str, float] | None = None,
+    metrics: list[str] | None = None,
 ) -> Data:
     means = []
     fill_vals = fill_vals or {}
+    metrics = metrics or ["branin"]
     for arm in batch.arms:
         params = arm.parameters
         for k, v in fill_vals.items():
@@ -2402,17 +2411,18 @@ def get_branin_data_batch(
                     float(none_throws(params["x2"])),
                 )
             )
-    return Data(
-        pd.DataFrame(
-            {
-                "trial_index": batch.index,
-                "arm_name": [arm.name for arm in batch.arms],
-                "metric_name": "branin",
-                "mean": means,
-                "sem": 0.1,
-            }
-        )
-    )
+    records = [
+        {
+            "trial_index": batch.index,
+            "arm_name": batch.arms[i].name,
+            "metric_name": metric,
+            "mean": means[i],
+            "sem": 0.1,
+        }
+        for i in range(len(means))
+        for metric in metrics
+    ]
+    return Data(pd.DataFrame.from_records(records))
 
 
 def get_branin_data_multi_objective(
@@ -2591,7 +2601,15 @@ def get_botorch_model_with_default_acquisition_class() -> BoTorchGenerator:
 def get_botorch_model_with_surrogate_specs() -> BoTorchGenerator:
     return BoTorchGenerator(
         surrogate_specs={
-            "name": SurrogateSpec(botorch_model_kwargs={"some_option": "some_value"})
+            "name": SurrogateSpec(
+                model_configs=[
+                    ModelConfig(
+                        model_options={"some_option": "some_value"},
+                        covar_module_class=DefaultRBFKernel,
+                        covar_module_options={"inactive_features": []},
+                    )
+                ]
+            )
         }
     )
 

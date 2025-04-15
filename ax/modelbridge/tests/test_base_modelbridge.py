@@ -32,6 +32,7 @@ from ax.core.parameter_constraint import SumConstraint
 from ax.core.search_space import SearchSpace
 from ax.core.utils import get_target_trial_index
 from ax.exceptions.core import UnsupportedError, UserInputError
+from ax.exceptions.model import ModelError
 from ax.modelbridge.base import (
     Adapter,
     clamp_observation_features,
@@ -44,6 +45,7 @@ from ax.modelbridge.base import (
 from ax.modelbridge.factory import get_sobol
 from ax.modelbridge.registry import Y_trans
 from ax.modelbridge.transforms.fill_missing_parameters import FillMissingParameters
+from ax.modelbridge.transforms.standardize_y import StandardizeY
 from ax.models.base import Generator
 from ax.utils.common.constants import Keys
 from ax.utils.common.logger import get_logger
@@ -55,11 +57,11 @@ from ax.utils.testing.core_stubs import (
     get_branin_experiment_with_timestamp_map_metric,
     get_branin_optimization_config,
     get_experiment,
+    get_experiment_with_observations,
     get_experiment_with_repeated_arms,
     get_non_monolithic_branin_moo_data,
     get_optimization_config_no_constraints,
     get_search_space_for_range_value,
-    get_search_space_for_range_values,
     get_search_space_for_value,
 )
 from ax.utils.testing.modeling_stubs import (
@@ -68,7 +70,6 @@ from ax.utils.testing.modeling_stubs import (
     get_observation1trans,
     get_observation2,
     get_observation2trans,
-    get_observation_status_quo0,
     transform_1,
     transform_2,
 )
@@ -112,34 +113,15 @@ class BaseAdapterTest(TestCase):
             # pyre-ignore[6]: Intentionally wrong argument type.
             adapter.predict([Arm(parameters={"x": 1.0})])
 
-        # Test prediction on out of design features.
+        # Test errors on prediction.
         adapter._predict = mock.MagicMock(
             "ax.modelbridge.base.Adapter._predict",
             autospec=True,
-            side_effect=ValueError("Out of Design"),
+            side_effect=ValueError("Predict failed"),
         )
-        # This point is in design, and thus failures in predict are legitimate.
-        with mock.patch.object(
-            Adapter, "model_space", return_value=get_search_space_for_range_values
-        ):
-            with self.assertRaises(ValueError):
-                adapter.predict([get_observation2().features])
-
-        # This point is out of design, and not in training data.
-        with self.assertRaises(ValueError):
-            adapter.predict([get_observation_status_quo0().features])
-
-        # Now it's in the training data.
-        with mock.patch.object(
-            Adapter,
-            "get_training_data",
-            return_value=[get_observation_status_quo0()],
-        ):
-            # Return raw training value.
-            self.assertEqual(
-                adapter.predict([get_observation_status_quo0().features]),
-                unwrap_observation_data([get_observation_status_quo0().data]),
-            )
+        obs_features = [get_observation2().features]
+        with self.assertRaisesRegex(ValueError, "Predict failed"):
+            adapter.predict(obs_features)
 
         # Test that transforms are applied correctly on predict
         mock_predict = mock.MagicMock(
@@ -148,19 +130,10 @@ class BaseAdapterTest(TestCase):
             return_value=[get_observation2trans().data],
         )
         adapter._predict = mock_predict
-        adapter.predict([get_observation2().features])
+        adapter.predict(obs_features)
         # Observation features sent to _predict are un-transformed afterwards
         mock_predict.assert_called_with(
-            observation_features=[get_observation2().features],
-            use_posterior_predictive=False,
-        )
-
-        # Check that _single_predict is equivalent here.
-        adapter._single_predict([get_observation2().features])
-        # Observation features sent to _predict are un-transformed afterwards
-        mock_predict.assert_called_with(
-            observation_features=[get_observation2().features],
-            use_posterior_predictive=False,
+            observation_features=obs_features, use_posterior_predictive=False
         )
 
         # Test transforms applied on gen
@@ -583,22 +556,27 @@ class BaseAdapterTest(TestCase):
             none_throws(adapter.status_quo.features.metadata)["timestamp"], 2.0
         )
 
-        # Case 2: Experiment has an optimization config with multiple map keys.
-        with mock.patch(
-            "ax.modelbridge.base.extract_map_keys_from_opt_config",
-            return_value={"timestamp", "step"},
-        ) as mock_extract, self.assertLogs(logger=logger, level="WARN") as mock_logs:
-            adapter = Adapter(
-                experiment=exp, model=Generator(), data_loader_config=data_loader_config
+        # Case 2: Experiment has an optimization config with !=1 map keys.
+        for num_map_keys in (0, 2):
+            with mock.patch(
+                "ax.modelbridge.base.extract_map_keys_from_opt_config",
+                return_value=set(["timestamp", "step"][:num_map_keys]),
+            ) as mock_extract, self.assertLogs(
+                logger=logger, level="WARN"
+            ) as mock_logs:
+                adapter = Adapter(
+                    experiment=exp,
+                    model=Generator(),
+                    data_loader_config=data_loader_config,
+                )
+            mock_extract.assert_called_once()
+            self.assertIsNone(adapter.status_quo)
+            self.assertTrue(
+                any(
+                    f"optimization config includes {num_map_keys} map keys" in log
+                    for log in mock_logs.output
+                )
             )
-        mock_extract.assert_called_once()
-        self.assertIsNone(adapter.status_quo)
-        self.assertTrue(
-            any(
-                "optimization config includes multiple map keys" in log
-                for log in mock_logs.output
-            )
-        )
 
         # Case 3: Experiment doesn't have an optimization config.
         (opt_metric,) = none_throws(exp.optimization_config).metrics.values()
@@ -682,8 +660,7 @@ class BaseAdapterTest(TestCase):
             observation_features=[get_observation1trans().features], weights=[2]
         ),
     )
-    @mock.patch("ax.modelbridge.base.Adapter.predict", autospec=True, return_value=None)
-    def test_GenWithDefaults(self, _, mock_gen: Mock) -> None:
+    def test_GenWithDefaults(self, mock_gen: Mock) -> None:
         exp = get_experiment_for_value()
         exp.optimization_config = get_optimization_config_no_constraints()
         ss = get_search_space_for_range_value()
@@ -709,8 +686,7 @@ class BaseAdapterTest(TestCase):
             observation_features=[get_observation1trans().features], weights=[2]
         ),
     )
-    @mock.patch("ax.modelbridge.base.Adapter.predict", autospec=True, return_value=None)
-    def test_gen_on_experiment_with_imm_ss_and_opt_conf(self, _, __) -> None:
+    def test_gen_on_experiment_with_imm_ss_and_opt_conf(self, _) -> None:
         exp = get_experiment_for_value()
         exp._properties[Keys.IMMUTABLE_SEARCH_SPACE_AND_OPT_CONF] = True
         exp.optimization_config = get_optimization_config_no_constraints()
@@ -968,3 +944,51 @@ class BaseAdapterTest(TestCase):
         adapter = Adapter(experiment=exp, model=Generator(), data=MapData())
         adapter._process_and_transform_data(experiment=exp, data=MapData())
         lookup_patch.assert_not_called()
+
+    def test_predict(self) -> None:
+        # Construct an experiment with observations having std dev = 2.0
+        np_obs = np.random.randn(5, 1)
+        np_obs = np_obs / np.std(np_obs, ddof=1) * 2.0
+        np_obs = np_obs - np.mean(np_obs)
+
+        experiment = get_experiment_with_observations(observations=np_obs.tolist())
+        adapter = Adapter(
+            experiment=experiment,
+            model=Generator(),
+            transforms=[StandardizeY],
+        )
+
+        def mock_predict(
+            observation_features: list[ObservationFeatures],
+            use_posterior_predictive: bool = False,
+        ) -> list[ObservationData]:
+            return [
+                ObservationData(
+                    metric_names=["m1"], means=np.ones((1)), covariance=np.ones((1, 1))
+                )
+                for _ in observation_features
+            ]
+
+        obs_features = [
+            ObservationFeatures(parameters={"x": 3.0, "y": 4.0}) for _ in range(3)
+        ]
+        with mock.patch.object(
+            adapter, "_predict", side_effect=mock_predict
+        ) as mock_pred:
+            f, _ = adapter.predict(observation_features=obs_features)
+        mock_pred.assert_called_once_with(
+            observation_features=obs_features, use_posterior_predictive=False
+        )
+        # Check that the predictions were un-transformed with std dev = 2.0.
+        self.assertTrue(np.allclose(f["m1"], np.ones(3) * 2.0))
+
+        # Test for error if an observation is dropped.
+        with mock.patch.object(
+            adapter, "_predict", side_effect=mock_predict
+        ), self.assertRaisesRegex(ModelError, "Predictions resulted in fewer"):
+            adapter.predict(
+                observation_features=[
+                    ObservationFeatures(parameters={"x": 3.0, "y": 4.0}),
+                    ObservationFeatures(parameters={"x": 3.0, "y": None}),
+                ]
+            )
